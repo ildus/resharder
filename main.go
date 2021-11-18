@@ -143,91 +143,71 @@ func manualCopy() {
 		log.Fatalf("copy from stdin failed:%v", err)
 	}
 
-	count := 0
-one:
-	count += 1
-
-	if count == 20 {
-		return
-	}
-
 	stopChan := make(chan bool)
 	go func() {
 		var err error
 		var msg pgproto3.BackendMessage
 
-		var first = true
-
-		for {
-			msg, err = dest.ReceiveMessage(context.Background())
-			if err != nil {
-				log.Fatalf("copy from stdin failed:%v", err)
-			}
-
-			switch msg := msg.(type) {
-			case *pgproto3.CopyInResponse:
-				log.Println("dest: got copy in data");
-			case *pgproto3.CopyOutResponse:
-				log.Println("dest: got copy out data");
-			case *pgproto3.CopyDone:
-				log.Println("dest: got copy data");
-			case *pgproto3.CopyData:
-				log.Println("dest: got copy data");
-			case *pgproto3.ReadyForQuery:
-				log.Println("dest: got ready for query");
-			case *pgproto3.CommandComplete:
-				log.Printf("dest: command complete: %v\n", msg.CommandTag);
-			case *pgproto3.ErrorResponse:
-				pgErr := ErrorResponseToPgError(msg)
-				log.Printf("dest: error response: %v\n", pgErr);
-			default:
-				log.Printf("dest msg: %+v\n", msg);
-			}
-
-			if (first) {
-				stopChan <- true
-			}
-			first = false
+		msg, err = dest.ReceiveMessage(context.Background())
+		if err != nil {
+			log.Fatalf("copy from stdin failed:%v", err)
 		}
+
+		switch msg := msg.(type) {
+		case *pgproto3.CopyInResponse:
+			log.Println("dest: got copy in response");
+		case *pgproto3.CopyOutResponse:
+			log.Println("dest: got copy out response");
+		case *pgproto3.ErrorResponse:
+			pgErr := ErrorResponseToPgError(msg)
+			log.Printf("dest: error response: %v\n", pgErr);
+		default:
+		}
+
+		stopChan <- true
 	}()
 
-	var first = true
-	var msg pgproto3.BackendMessage
-	msg, err = src.ReceiveMessage(context.Background())
-	if err != nil {
-		log.Fatalf("copy to stdout failed:%v", err)
-	}
+	count := 0
 
-	if first {
-		<-stopChan
-	}
-	first = false
-
-	switch msg := msg.(type) {
-	case *pgproto3.CopyInResponse:
-		log.Println("src: got copy in data");
-	case *pgproto3.CopyOutResponse:
-		log.Println("src: got copy out data");
-	case *pgproto3.CopyDone:
-	case *pgproto3.CopyData:
-		log.Println("src: got copy data");
-		if err = dest.SendBytes(context.Background(), msg.Data); err != nil {
-			log.Fatalf("sending to destination failed:%v", err)
+	for {
+		var msg pgproto3.BackendMessage
+		msg, err = src.ReceiveMessage(context.Background())
+		if err != nil {
+			log.Fatalf("copy to stdout failed:%v", err)
 		}
 
-	case *pgproto3.ReadyForQuery:
-		log.Println("src: got ready for query");
-	case *pgproto3.CommandComplete:
-		log.Printf("src:command complete: %v\n", msg.CommandTag);
-	case *pgproto3.ErrorResponse:
-		pgErr := ErrorResponseToPgError(msg)
-		log.Printf("src: error response: %v\n", pgErr);
-	default:
-		log.Printf("src msg: %+v\n", msg);
+		if count == 0 {
+			<-stopChan
+		}
+		count += 1
+
+		if count == 20 {
+			break
+		}
+
+		switch msg := msg.(type) {
+		case *pgproto3.CopyInResponse:
+			log.Println("src: got copy in response");
+		case *pgproto3.CopyOutResponse:
+			log.Println("src: got copy out response");
+		case *pgproto3.CopyDone:
+		case *pgproto3.CopyData:
+			log.Printf("src: got copy data, sending to dest: %v\n", msg.Data);
+			if err = dest.SendBytes(context.Background(), msg.Data); err != nil {
+				log.Fatalf("sending to destination failed:%v", err)
+			}
+
+		case *pgproto3.ReadyForQuery:
+			log.Println("src: got ready for query");
+		case *pgproto3.CommandComplete:
+			log.Printf("src:command complete: %v\n", msg.CommandTag);
+		case *pgproto3.ErrorResponse:
+			pgErr := ErrorResponseToPgError(msg)
+			log.Printf("src: error response: %v\n", pgErr);
+		default:
+			log.Printf("src msg: %+v\n", msg);
+		}
 	}
-
-
-	goto one
 }
 
 func main() {
