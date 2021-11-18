@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"github.com/jackc/pgconn"
+	"github.com/jackc/pgproto3/v2"
 	"log"
 	"io"
 	"errors"
@@ -65,7 +66,7 @@ func systemTime(t *syscall.Rusage) float64 {
     return float64(t.Stime.Sec) + 1e-6*float64(t.Stime.Usec);
 }
 
-func main() {
+func copyUsingChannel() {
 	var err error
 
 	src := connect()
@@ -94,4 +95,141 @@ func main() {
 	log.Printf("  CPU time: %.06f sec user, %.06f sec system\n",
            userTime(&usage), systemTime(&usage));
 	log.Printf("  Max resident memory size (kb): %d\n", usage.Maxrss);
+}
+
+func ErrorResponseToPgError(msg *pgproto3.ErrorResponse) *pgconn.PgError {
+	return &pgconn.PgError{
+		Severity:         msg.Severity,
+		Code:             string(msg.Code),
+		Message:          string(msg.Message),
+		Detail:           string(msg.Detail),
+		Hint:             msg.Hint,
+		Position:         msg.Position,
+		InternalPosition: msg.InternalPosition,
+		InternalQuery:    string(msg.InternalQuery),
+		Where:            string(msg.Where),
+		SchemaName:       string(msg.SchemaName),
+		TableName:        string(msg.TableName),
+		ColumnName:       string(msg.ColumnName),
+		DataTypeName:     string(msg.DataTypeName),
+		ConstraintName:   msg.ConstraintName,
+		File:             string(msg.File),
+		Line:             msg.Line,
+		Routine:          string(msg.Routine),
+	}
+}
+
+func manualCopy() {
+	var query []byte
+	var err error
+
+	src := connect()
+	dest := connect()
+
+	defer src.Close(context.Background())
+	defer dest.Close(context.Background())
+
+	sql := "COPY ( select * from pgbench_accounts ) TO STDOUT"
+	query = (&pgproto3.Query{String: sql}).Encode(query)
+
+	if err = src.SendBytes(context.Background(), query); err != nil {
+		log.Fatalf("copy to stdout failed:%v", err)
+	}
+
+	sql = "COPY pgbench_accounts_copy FROM stdin"
+	query = (&pgproto3.Query{String: sql}).Encode(query)
+
+	if err = dest.SendBytes(context.Background(), query); err != nil {
+		log.Fatalf("copy from stdin failed:%v", err)
+	}
+
+	count := 0
+one:
+	count += 1
+
+	if count == 20 {
+		return
+	}
+
+	stopChan := make(chan bool)
+	go func() {
+		var err error
+		var msg pgproto3.BackendMessage
+
+		var first = true
+
+		for {
+			msg, err = dest.ReceiveMessage(context.Background())
+			if err != nil {
+				log.Fatalf("copy from stdin failed:%v", err)
+			}
+
+			switch msg := msg.(type) {
+			case *pgproto3.CopyInResponse:
+				log.Println("dest: got copy in data");
+			case *pgproto3.CopyOutResponse:
+				log.Println("dest: got copy out data");
+			case *pgproto3.CopyDone:
+				log.Println("dest: got copy data");
+			case *pgproto3.CopyData:
+				log.Println("dest: got copy data");
+			case *pgproto3.ReadyForQuery:
+				log.Println("dest: got ready for query");
+			case *pgproto3.CommandComplete:
+				log.Printf("dest: command complete: %v\n", msg.CommandTag);
+			case *pgproto3.ErrorResponse:
+				pgErr := ErrorResponseToPgError(msg)
+				log.Printf("dest: error response: %v\n", pgErr);
+			default:
+				log.Printf("dest msg: %+v\n", msg);
+			}
+
+			if (first) {
+				stopChan <- true
+			}
+			first = false
+		}
+	}()
+
+	var first = true
+	var msg pgproto3.BackendMessage
+	msg, err = src.ReceiveMessage(context.Background())
+	if err != nil {
+		log.Fatalf("copy to stdout failed:%v", err)
+	}
+
+	if first {
+		<-stopChan
+	}
+	first = false
+
+	switch msg := msg.(type) {
+	case *pgproto3.CopyInResponse:
+		log.Println("src: got copy in data");
+	case *pgproto3.CopyOutResponse:
+		log.Println("src: got copy out data");
+	case *pgproto3.CopyDone:
+	case *pgproto3.CopyData:
+		log.Println("src: got copy data");
+		if err = dest.SendBytes(context.Background(), msg.Data); err != nil {
+			log.Fatalf("sending to destination failed:%v", err)
+		}
+
+	case *pgproto3.ReadyForQuery:
+		log.Println("src: got ready for query");
+	case *pgproto3.CommandComplete:
+		log.Printf("src:command complete: %v\n", msg.CommandTag);
+	case *pgproto3.ErrorResponse:
+		pgErr := ErrorResponseToPgError(msg)
+		log.Printf("src: error response: %v\n", pgErr);
+	default:
+		log.Printf("src msg: %+v\n", msg);
+	}
+
+
+	goto one
+}
+
+func main() {
+	manualCopy()
 }
