@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"github.com/jackc/pgconn"
+	"github.com/jackc/pgio"
 	"github.com/jackc/pgproto3/v2"
 	"log"
 	"io"
@@ -121,6 +122,7 @@ func ErrorResponseToPgError(msg *pgproto3.ErrorResponse) *pgconn.PgError {
 
 func manualCopy() {
 	var query []byte
+	var query2 []byte
 	var err error
 
 	src := connect()
@@ -129,17 +131,17 @@ func manualCopy() {
 	defer src.Close(context.Background())
 	defer dest.Close(context.Background())
 
-	sql := "COPY ( select * from pgbench_accounts ) TO STDOUT"
+	sql := "COPY ( select * from pgbench_accounts limit 10 ) TO STDOUT"
 	query = (&pgproto3.Query{String: sql}).Encode(query)
 
 	if err = src.SendBytes(context.Background(), query); err != nil {
 		log.Fatalf("copy to stdout failed:%v", err)
 	}
 
-	sql = "COPY pgbench_accounts_copy FROM stdin"
-	query = (&pgproto3.Query{String: sql}).Encode(query)
+	sql2 := "COPY pgbench_accounts_copy FROM stdin"
+	query2 = (&pgproto3.Query{String: sql2}).Encode(query2)
 
-	if err = dest.SendBytes(context.Background(), query); err != nil {
+	if err = dest.SendBytes(context.Background(), query2); err != nil {
 		log.Fatalf("copy from stdin failed:%v", err)
 	}
 
@@ -169,6 +171,12 @@ func manualCopy() {
 
 	count := 0
 
+	buf := make([]byte, 0, 65536)
+	buf = append(buf, 'd')
+	sp := len(buf)
+	buf = buf[0 : 5]
+
+loop:
 	for {
 		var msg pgproto3.BackendMessage
 		msg, err = src.ReceiveMessage(context.Background())
@@ -181,24 +189,29 @@ func manualCopy() {
 		}
 		count += 1
 
-		if count == 20 {
-			break
-		}
-
 		switch msg := msg.(type) {
 		case *pgproto3.CopyInResponse:
 			log.Println("src: got copy in response");
 		case *pgproto3.CopyOutResponse:
 			log.Println("src: got copy out response");
 		case *pgproto3.CopyDone:
+			log.Println("src: got copy done");
 		case *pgproto3.CopyData:
-			log.Printf("src: got copy data, sending to dest: %v\n", msg.Data);
-			if err = dest.SendBytes(context.Background(), msg.Data); err != nil {
-				log.Fatalf("sending to destination failed:%v", err)
-			}
+			if (count <= 3) {
+				log.Printf("src: got copy data, sending to dest: %s\n", string(msg.Data))
 
+				pgio.SetInt32(buf[sp:], int32(len(msg.Data)+4))
+				log.Printf("%v", buf)
+				if err = dest.SendBytes(context.Background(), buf); err != nil {
+					log.Fatalf("sending to destination failed:%v", err)
+				}
+				if err = dest.SendBytes(context.Background(), msg.Data); err != nil {
+					log.Fatalf("sending to destination failed:%v", err)
+				}
+			}
 		case *pgproto3.ReadyForQuery:
 			log.Println("src: got ready for query");
+			break loop
 		case *pgproto3.CommandComplete:
 			log.Printf("src:command complete: %v\n", msg.CommandTag);
 		case *pgproto3.ErrorResponse:
