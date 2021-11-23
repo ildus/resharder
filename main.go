@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"syscall"
+	"os"
+	"bufio"
 )
 
 func connect() *pgconn.PgConn {
@@ -131,7 +133,17 @@ func manualCopy() {
 	defer src.Close(context.Background())
 	defer dest.Close(context.Background())
 
-	sql := "COPY ( select * from pgbench_accounts limit 10 ) TO STDOUT"
+	resultReader := dest.Exec(context.Background(), "select pg_backend_pid()");
+	results, err := resultReader.ReadAll()
+	if err != nil {
+		log.Fatalf("error:%v", err)
+	}
+	log.Printf("pid=%v, any key to continue..\n", string(results[0].Rows[0][0]))
+	input := bufio.NewScanner(os.Stdin)
+    input.Scan()
+	log.Printf("ok")
+
+	sql := "COPY ( select * from pgbench_accounts limit 3 ) TO STDOUT"
 	query = (&pgproto3.Query{String: sql}).Encode(query)
 
 	if err = src.SendBytes(context.Background(), query); err != nil {
@@ -171,7 +183,7 @@ func manualCopy() {
 
 	count := 0
 
-	buf := make([]byte, 0, 65536)
+	buf := make([]byte, 0, 65535)
 	buf = append(buf, 'd')
 	sp := len(buf)
 	buf = buf[0 : 5]
@@ -197,17 +209,19 @@ loop:
 		case *pgproto3.CopyDone:
 			log.Println("src: got copy done");
 		case *pgproto3.CopyData:
-			if (count <= 3) {
-				log.Printf("src: got copy data, sending to dest: %s\n", string(msg.Data))
+			log.Printf("src: got copy data, sending to dest: %s\n", string(msg.Data))
 
-				pgio.SetInt32(buf[sp:], int32(len(msg.Data)+4))
-				log.Printf("%v", buf)
-				if err = dest.SendBytes(context.Background(), buf); err != nil {
-					log.Fatalf("sending to destination failed:%v", err)
-				}
-				if err = dest.SendBytes(context.Background(), msg.Data); err != nil {
-					log.Fatalf("sending to destination failed:%v", err)
-				}
+			buf = buf[0:len(msg.Data) + 5]
+			pgio.SetInt32(buf[sp:], int32(len(msg.Data)+4))
+			copy(buf[5:], msg.Data)
+			log.Printf("%v", buf)
+
+			if (count == 3) {
+				buf[0] = 'c'
+			}
+
+			if err = dest.SendBytes(context.Background(), buf); err != nil {
+				log.Fatalf("sending to destination failed:%v", err)
 			}
 		case *pgproto3.ReadyForQuery:
 			log.Println("src: got ready for query");
@@ -221,6 +235,11 @@ loop:
 			log.Printf("src msg: %+v\n", msg);
 		}
 	}
+
+	log.Printf("any key to continue..\n")
+	input = bufio.NewScanner(os.Stdin)
+    input.Scan()
+	log.Printf("ok")
 }
 
 func main() {
