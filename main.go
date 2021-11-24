@@ -158,27 +158,49 @@ func manualCopy() {
 	}
 
 	stopChan := make(chan bool)
+	sigChan := make(chan bool)
+	endChan := make(chan bool)
+
 	go func() {
 		var err error
 		var msg pgproto3.BackendMessage
 
-		msg, err = dest.ReceiveMessage(context.Background())
-		if err != nil {
-			log.Fatalf("copy from stdin failed:%v", err)
-		}
+		first := true
 
-		switch msg := msg.(type) {
-		case *pgproto3.CopyInResponse:
-			log.Println("dest: got copy in response");
-		case *pgproto3.CopyOutResponse:
-			log.Println("dest: got copy out response");
-		case *pgproto3.ErrorResponse:
-			pgErr := ErrorResponseToPgError(msg)
-			log.Printf("dest: error response: %v\n", pgErr);
-		default:
-		}
+loop:
+		for {
+			msg, err = dest.ReceiveMessage(context.Background())
+			if err != nil {
+				log.Fatalf("copy from stdin failed:%v", err)
+			}
 
-		stopChan <- true
+			switch msg := msg.(type) {
+			case *pgproto3.CopyInResponse:
+				log.Println("dest: got copy in response");
+			case *pgproto3.CopyOutResponse:
+				log.Println("dest: got copy out response");
+			case *pgproto3.ReadyForQuery:
+				log.Println("dest: got ready for query");
+				break loop
+			case *pgproto3.ErrorResponse:
+				pgErr := ErrorResponseToPgError(msg)
+				log.Printf("dest: error response: %v\n", pgErr);
+			default:
+				log.Printf("src msg: %+v\n", msg);
+			}
+
+			if (first) {
+				stopChan <- true
+				first = false
+			}
+
+			select {
+			case <-sigChan:
+				continue
+			case <-endChan:
+				break loop
+			}
+		}
 	}()
 
 	count := 0
@@ -207,7 +229,16 @@ loop:
 		case *pgproto3.CopyOutResponse:
 			log.Println("src: got copy out response");
 		case *pgproto3.CopyDone:
+			buf = buf[:0]
 			log.Println("src: got copy done");
+			copyDone := &pgproto3.CopyDone{}
+			buf = copyDone.Encode(buf)
+			log.Printf("%v", buf)
+
+			if err = dest.SendBytes(context.Background(), buf); err != nil {
+				log.Fatalf("sending to destination failed:%v", err)
+			}
+			sigChan <- true
 		case *pgproto3.CopyData:
 			log.Printf("src: got copy data, sending to dest: %s\n", string(msg.Data))
 
@@ -215,10 +246,6 @@ loop:
 			pgio.SetInt32(buf[sp:], int32(len(msg.Data)+4))
 			copy(buf[5:], msg.Data)
 			log.Printf("%v", buf)
-
-			if (count == 3) {
-				buf[0] = 'c'
-			}
 
 			if err = dest.SendBytes(context.Background(), buf); err != nil {
 				log.Fatalf("sending to destination failed:%v", err)
@@ -239,6 +266,7 @@ loop:
 	log.Printf("any key to continue..\n")
 	input = bufio.NewScanner(os.Stdin)
     input.Scan()
+	endChan <- true
 	log.Printf("ok")
 }
 
