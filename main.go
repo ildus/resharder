@@ -186,7 +186,7 @@ loop:
 				pgErr := ErrorResponseToPgError(msg)
 				log.Printf("dest: error response: %v\n", pgErr);
 			default:
-				log.Printf("src msg: %+v\n", msg);
+				log.Printf("dest msg: %+v\n", msg)
 			}
 
 			if (first) {
@@ -242,12 +242,14 @@ loop:
 		case *pgproto3.CopyData:
 			log.Printf("src: got copy data, sending to dest: %s\n", string(msg.Data))
 
-			buf = buf[0:len(msg.Data) + 5]
+			buf = buf[0:5]
 			pgio.SetInt32(buf[sp:], int32(len(msg.Data)+4))
-			copy(buf[5:], msg.Data)
 			log.Printf("%v", buf)
 
 			if err = dest.SendBytes(context.Background(), buf); err != nil {
+				log.Fatalf("sending to destination failed:%v", err)
+			}
+			if err = dest.SendBytes(context.Background(), msg.Data); err != nil {
 				log.Fatalf("sending to destination failed:%v", err)
 			}
 		case *pgproto3.ReadyForQuery:
