@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"os"
 	"bufio"
+	"runtime/pprof"
 )
 
 func connect() *pgconn.PgConn {
@@ -207,11 +208,12 @@ loop:
 
 	waitForCopyIn := true
 
-	buf := make([]byte, 0, 65535)
+	buf := make([]byte, 0, 1000000000)
 	buf = append(buf, 'd')
 	sp := len(buf)
 	buf = buf[0 : 5]
 	rowsCopied := 0
+	rp := 0
 
 loop:
 	for {
@@ -237,13 +239,13 @@ loop:
 			}
 			syncChan <- true
 		case *pgproto3.CopyData:
-			buf = buf[0:5]
-			pgio.SetInt32(buf[sp:], int32(len(msg.Data)+4))
+			buf[rp] := 'd'
+			rp += 1
+			pgio.SetInt32(buf[rp], int32(len(msg.Data)+4))
+			buf = buf[0:len(buf) + len(msg.Data) + 5]
+			copy(buf[5:], msg.Data)
 
 			if err = dest.SendBytes(context.Background(), buf); err != nil {
-				log.Panicf("sending to destination failed:%v", err)
-			}
-			if err = dest.SendBytes(context.Background(), msg.Data); err != nil {
 				log.Panicf("sending to destination failed:%v", err)
 			}
 			rowsCopied += 1
@@ -273,8 +275,14 @@ loop:
 }
 
 func main() {
-	manualCopy()
+	f, err := os.Create("cpuprofile")
+	if err != nil {
+		log.Fatal(err)
+	}
+	pprof.StartCPUProfile(f)
+	defer pprof.StopCPUProfile()
 
+	manualCopy()
 	var usage syscall.Rusage
 	syscall.Getrusage(syscall.RUSAGE_SELF, &usage)
 	log.Printf("  CPU time: %.06f sec user, %.06f sec system\n",
