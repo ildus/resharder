@@ -92,12 +92,6 @@ func copyUsingChannel() {
 		log.Fatal(errText)
 	}
 	buf.Done()
-
-	var usage syscall.Rusage
-	syscall.Getrusage(syscall.RUSAGE_SELF, &usage)
-	log.Printf("  CPU time: %.06f sec user, %.06f sec system\n",
-           userTime(&usage), systemTime(&usage));
-	log.Printf("  Max resident memory size (kb): %d\n", usage.Maxrss);
 }
 
 func ErrorResponseToPgError(msg *pgproto3.ErrorResponse) *pgconn.PgError {
@@ -122,6 +116,22 @@ func ErrorResponseToPgError(msg *pgproto3.ErrorResponse) *pgconn.PgError {
 	}
 }
 
+func sendCopyFail(ctx context.Context, conn *pgconn.PgConn) error {
+	buf := make([]byte, 0, 100)
+	copyFail := &pgproto3.CopyFail{}
+	buf = copyFail.Encode(buf)
+
+	return conn.SendBytes(ctx, buf)
+}
+
+func sendCopyDone(ctx context.Context, conn *pgconn.PgConn) error {
+	buf := make([]byte, 0, 100)
+	copyDone := &pgproto3.CopyDone{}
+	buf = copyDone.Encode(buf)
+
+	return conn.SendBytes(ctx, buf)
+}
+
 func manualCopy() {
 	var query []byte
 	var query2 []byte
@@ -141,9 +151,8 @@ func manualCopy() {
 	log.Printf("pid=%v, any key to continue..\n", string(results[0].Rows[0][0]))
 	input := bufio.NewScanner(os.Stdin)
     input.Scan()
-	log.Printf("ok")
 
-	sql := "COPY ( select * from pgbench_accounts limit 3 ) TO STDOUT"
+	sql := "COPY ( select * from pgbench_accounts ) TO STDOUT"
 	query = (&pgproto3.Query{String: sql}).Encode(query)
 
 	if err = src.SendBytes(context.Background(), query); err != nil {
@@ -157,15 +166,12 @@ func manualCopy() {
 		log.Fatalf("copy from stdin failed:%v", err)
 	}
 
-	stopChan := make(chan bool)
-	sigChan := make(chan bool)
-	endChan := make(chan bool)
+	syncChan := make(chan bool)
+	errChan := make(chan *pgconn.PgError)
 
 	go func() {
 		var err error
 		var msg pgproto3.BackendMessage
-
-		first := true
 
 loop:
 		for {
@@ -176,39 +182,36 @@ loop:
 
 			switch msg := msg.(type) {
 			case *pgproto3.CopyInResponse:
-				log.Println("dest: got copy in response");
-			case *pgproto3.CopyOutResponse:
-				log.Println("dest: got copy out response");
-			case *pgproto3.ReadyForQuery:
-				log.Println("dest: got ready for query");
+				log.Println("dest: copy in started");
+				syncChan <- true
+			case *pgproto3.CommandComplete:
+				log.Println("dest: command complete");
+				syncChan <- true
 				break loop
 			case *pgproto3.ErrorResponse:
 				pgErr := ErrorResponseToPgError(msg)
+				errChan <- pgErr
 				log.Printf("dest: error response: %v\n", pgErr);
-			default:
-				log.Printf("dest msg: %+v\n", msg)
-			}
-
-			if (first) {
-				stopChan <- true
-				first = false
-			}
-
-			select {
-			case <-sigChan:
-				continue
-			case <-endChan:
 				break loop
+			default:
+				log.Printf("unexpected destination message: %+v\n", msg)
+			}
+
+			// wait for CopyDone message
+			select {
+				case <-syncChan:
+					continue
 			}
 		}
 	}()
 
-	count := 0
+	waitForCopyIn := true
 
 	buf := make([]byte, 0, 65535)
 	buf = append(buf, 'd')
 	sp := len(buf)
 	buf = buf[0 : 5]
+	rowsCopied := 0
 
 loop:
 	for {
@@ -218,60 +221,63 @@ loop:
 			log.Fatalf("copy to stdout failed:%v", err)
 		}
 
-		if count == 0 {
-			<-stopChan
+		if waitForCopyIn {
+			<-syncChan
+			waitForCopyIn = false
 		}
-		count += 1
 
 		switch msg := msg.(type) {
-		case *pgproto3.CopyInResponse:
-			log.Println("src: got copy in response");
 		case *pgproto3.CopyOutResponse:
-			log.Println("src: got copy out response");
+			log.Println("src: copy out started");
 		case *pgproto3.CopyDone:
-			buf = buf[:0]
-			log.Println("src: got copy done");
-			copyDone := &pgproto3.CopyDone{}
-			buf = copyDone.Encode(buf)
-			log.Printf("%v", buf)
+			log.Println("src: finishing copy out");
 
-			if err = dest.SendBytes(context.Background(), buf); err != nil {
-				log.Fatalf("sending to destination failed:%v", err)
+			if err = sendCopyDone(context.Background(), dest); err != nil {
+				log.Panicf("sending to destination failed:%v", err)
 			}
-			sigChan <- true
+			syncChan <- true
 		case *pgproto3.CopyData:
-			log.Printf("src: got copy data, sending to dest: %s\n", string(msg.Data))
-
 			buf = buf[0:5]
 			pgio.SetInt32(buf[sp:], int32(len(msg.Data)+4))
-			log.Printf("%v", buf)
 
 			if err = dest.SendBytes(context.Background(), buf); err != nil {
-				log.Fatalf("sending to destination failed:%v", err)
+				log.Panicf("sending to destination failed:%v", err)
 			}
 			if err = dest.SendBytes(context.Background(), msg.Data); err != nil {
-				log.Fatalf("sending to destination failed:%v", err)
+				log.Panicf("sending to destination failed:%v", err)
 			}
+			rowsCopied += 1
 		case *pgproto3.ReadyForQuery:
 			log.Println("src: got ready for query");
 			break loop
 		case *pgproto3.CommandComplete:
-			log.Printf("src:command complete: %v\n", msg.CommandTag);
+			log.Println("src: command complete");
 		case *pgproto3.ErrorResponse:
+			rowsCopied = 0
 			pgErr := ErrorResponseToPgError(msg)
-			log.Printf("src: error response: %v\n", pgErr);
+			log.Printf("src: got error response: %v, finishing\n", pgErr);
+
+			if err = sendCopyFail(context.Background(), dest); err != nil {
+				log.Panicf("sending to destination failed:%v", err)
+			}
+			syncChan <- true
 		default:
 			log.Printf("src msg: %+v\n", msg);
 		}
 	}
 
-	log.Printf("any key to continue..\n")
-	input = bufio.NewScanner(os.Stdin)
-    input.Scan()
-	endChan <- true
-	log.Printf("ok")
+	log.Printf("rows copied: %d\n", rowsCopied)
+
+	// wait for CommandComplete from dest
+	<-syncChan
 }
 
 func main() {
 	manualCopy()
+
+	var usage syscall.Rusage
+	syscall.Getrusage(syscall.RUSAGE_SELF, &usage)
+	log.Printf("  CPU time: %.06f sec user, %.06f sec system\n",
+           userTime(&usage), systemTime(&usage));
+	log.Printf("  Max resident memory size (kb): %d\n", usage.Maxrss);
 }
